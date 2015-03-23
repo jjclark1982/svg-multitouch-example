@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="http://code.jquery.com/jquery-1.9.1.min.js"></script>
+<script src="http://jashkenas.github.io/underscore/underscore.js"></script>
+<script src="http://jashkenas.github.io/backbone/backbone.js"></script>
+<script src="http://jashkenas.github.io/coffeescript/extras/coffee-script.js"></script>
+<!-- may want to prevent zooming categorically -->
+<!-- <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no"> -->
+<style> 
+svg {
+    cursor: copy;
+    width: 100%;
+    height: 1000px;
+}
+.movable-shape {
+    cursor: move;
+    filter: url(#drop-shadow);
+}
+.laser {
+    filter: url(#laser);
+}
+#notifications {
+    position: fixed;
+    background-color: rgba(0,0,0,0.75);
+    color: white;
+    border-radius: 1em;
+    top: 1em;
+    left: 25%;
+    width: 50%;
+}
+#notifications > p {
+    margin: 1em;
+}
+</style>
+</head>
+<body>
+<h1>Backbone SVG binding test page</h1>
+<svg id="main-map">
+    <filter id="drop-shadow" height="130%">
+        <feFlood flood-color="rgba(0,0,0,0.5)"/> <!-- a transparent black shadow -->
+        <feComposite in2="SourceAlpha" operator="in"/> <!-- mask the shadow to the source alpha -->
+        <feGaussianBlur stdDeviation="5"/> <!-- stdDeviation is how much to blur -->
+        <feOffset dx="0" dy="5"/> <!-- how much to offset -->
+        <feMerge> <!-- place the source image on top of the shadow -->
+            <feMergeNode/>
+            <feMergeNode in="SourceGraphic"/>
+        </feMerge>
+    </filter>
+    <filter id="laser">
+        <feGaussianBlur stdDeviation="2"/>
+        <feMerge> <!-- place the source image on top of the laser -->
+            <feMergeNode/>
+            <feMergeNode in="SourceGraphic"/>
+        </feMerge>
+    </filter>
+    <rect id="spacer" width="100%" height="100%" fill="transparent"/>
+    <!-- spacer is necessary for measuring offsets within the SVG in firefox -->
+    <g id="map-lines" stroke-width="3"></g>
+    <g id="map-shapes" stroke="black" stroke-width="2"></g>
+</svg>
+
+<div id="notifications"></div>
+
+<script type="text/coffeescript">
+svgDoc = $("svg")[0].ownerDocument
+svgNS = $("svg")[0].namespaceURI
+
+window.notify = (args...)->
+    $p = $("<p>")
+    for message in args
+        if _.isObject(message)
+            obj = {}
+            for key, val of message
+                try
+                    JSON.stringify(val)
+                    obj[key] = val
+                catch e
+                    obj[key] = toString.call(val)
+            message = JSON.stringify(obj)
+
+        $s = $("<span>")
+        $s.text(" " + message + " ")
+        $p.append($s)
+    $n = $("#notifications")
+    $n.append($p)
+    setTimeout(->
+        $p.remove()
+    , 5*1000)
+
+window.randomColor = ->
+    hue = Math.random()*360
+    sat = Math.random()*50+50 # mean 75% saturation
+    light = Math.random()*40+40 # mean 60% lightness
+    return "hsl(#{hue}, #{sat}%, #{light}%)"
+
+window.randomPath = (cx=0, cy=0)->
+    # start at the top
+    x0 = cx
+    y0 = cy - 50
+    data = "M #{x0} #{y0}"
+
+    # top right
+    x1 = 25 + Math.random()*25
+    y1 = 25 - Math.random()*50 # allow this to go above the top so its reflection can be below (see y4)
+    data += " s #{x1} #{y1} 50 50"
+
+    # bottom right
+    x2 = -25 + Math.random()*25
+    y2 = 25 + Math.random()*25
+    data += " s #{x2} #{y2} -50 50"
+
+    # bottom left
+    x3 = -25 - Math.random()*25
+    y3 = -25 + Math.random()*25
+    data += " s #{x3} #{y3} -50 -50"
+
+    # top left control point is the reflection of top right across top vertex to make a smooth curve
+    x4 = 50 - x1
+    y4 = -50 - y1
+    data += " s #{x4} #{y4} 50 -50"
+
+    return data + " z"
+
+
+window.mixHSL = (c1, c2)->
+    try
+        [none, h1, s1, l1] = c1.match(/hsl\(([0-9.]+)[\s,]*([0-9.]+)%[\s,]*([0-9.]+)%\)/)
+        [none, h2, s2, l2] = c2.match(/hsl\(([0-9.]+)[\s,]*([0-9.]+)%[\s,]*([0-9.]+)%\)/)
+        h1 = parseFloat(h1)
+        h2 = parseFloat(h2)
+        if Math.abs(h2-h1) < 180
+            h3 = (h1 + h2) / 2
+        else
+            h3 = (h1 + h2 + 360) / 2
+        s3 = (parseFloat(s1) + parseFloat(s2)) / 2
+        l3 = (parseFloat(l1) + parseFloat(l2)) / 2
+
+        return "hsl(#{h3}, #{s3}%, #{l3}%)"
+
+    catch e 
+        console.log e
+        return "black"
+
+window.getOffset = (el)->
+    for i in [0..el.transform.baseVal.numberOfItems]
+        xform = el.transform.baseVal.getItem(i)
+        if xform.type is SVGTransform.SVG_TRANSFORM_TRANSLATE
+            return {x: xform.matrix.e, y: xform.matrix.f}
+    return {x:0, y:0}
+
+class MovableShapeView extends Backbone.View
+    events: {
+        "click": "intercept"
+        "mousedown": "startMoving"
+        "touchstart": "startMoving"
+        "touchmove": "move"
+        "touchend": "finishMoving"
+        "touchcancel": "finishMoving"
+    }
+
+    intercept: (event)->
+        # prevent the click from reaching the map
+        event.stopPropagation()
+
+    startMoving: (event)->
+        event.preventDefault() # avoid selecting text
+        elOffset = getOffset(@el)
+        loc = event.originalEvent.targetTouches?[0] or event
+        @moveStartLoc = {
+            x: loc.pageX - elOffset.x
+            y: loc.pageY - elOffset.y
+        }
+        $(window).on("mousemove", @move)
+        $(window).on("mouseup", @finishMoving)
+        #$("#map-lines").attr("class", "")
+
+    move: (event)=>
+        return unless @moveStartLoc
+        event.preventDefault() # avoid scrolling
+        loc = event.originalEvent.targetTouches?[0] or event
+        newX = loc.pageX - @moveStartLoc.x
+        newY = loc.pageY - @moveStartLoc.y
+        @$el.attr("transform", "translate(#{newX}, #{newY})")
+        updateLinesSoon()
+
+    finishMoving: (event)=>
+        @move(event) if event.type is 'mouseup'
+        $(window).off("mousemove", @move)
+        $(window).off("mouseup", @finishMoving)
+        @moveStartLoc = null
+        updateLines()
+        #$("#map-lines").attr("class", "laser")
+
+class MapView extends Backbone.View
+    events: {
+        "click": "addShape"
+    }
+
+    addShape: (event)->
+        shapeEl = svgDoc.createElementNS(svgNS, "path")
+        x = event.pageX - @$el.offset().left
+        y = event.pageY - @$el.offset().top
+        $(shapeEl).attr({
+            class: "movable-shape"
+            d: randomPath()
+            #cx: event.offsetX
+            #cy: event.offsetY
+            #r: 50
+            transform: "translate(#{x}, #{y})"
+            fill: randomColor()
+        })
+
+        @$("#map-shapes").append(shapeEl)
+
+        subview = new MovableShapeView({el: shapeEl})
+        @subviews ?= {}
+        @subviews[subview.cid] = subview
+        updateLines()
+
+
+updateLines = ->
+    $lineGroup = $("#map-lines")
+    $lines = $lineGroup.find(".connecting-line")
+    lineNo = 0
+    $shapes = $(".movable-shape")
+    x = []
+    y = []
+    color = []
+    for shape, i in $shapes
+        offset = getOffset(shape)
+        x[i] = offset.x
+        y[i] = offset.y
+        color[i] = $(shape).attr("fill")
+    for shape, i in $shapes
+        for j in [0..i]
+            continue if j is i
+            line = $lines[lineNo++]
+            # favor horizontal connections on the right and vertical connections on the left
+            if x[i] < x[j]
+                x1 = (x[i] + x[j])/2
+                y1 = y[i]
+            else
+                x1 = x[i]
+                y1 = (y[i] + y[j])/2
+            unless line
+                line = svgDoc.createElementNS(svgNS, "path")
+                $(line).attr({
+                    class: "connecting-line"
+                    fill: "transparent"
+                    #stroke: randomColor()
+                    stroke: mixHSL(color[i], color[j])
+                })
+                $lineGroup.append(line)
+            $(line).attr({
+                d: "M #{x[i]} #{y[i]} S #{x1} #{y1} #{x[j]} #{y[j]}"
+                #x1: x[i]
+                #y1: y[i]
+                #x2: x[j]
+                #y2: y[j]
+            })
+
+updateLinesSoon = _.throttle(updateLines, 16)
+
+window.map = new MapView({el: $("#main-map")})
+
+#map.addShape({target: map.el, offsetX: 100, offsetY: 100})
+#notify("hello")
+
+</script>
+</body>
+</html>
